@@ -28,6 +28,7 @@ from .merge import (
     build_apply_preview,
 )
 from .review import (
+    SIG_VERSION,
     build_parts,
     build_status,
     evaluate_gate,
@@ -436,6 +437,7 @@ def confirm_review(draft_id: int, req: ReviewConfirmRequest) -> dict:
                 "revision": current_rev,
                 "confirmed_at": now,
                 "sig": parts[cid]["sig"],
+                "sig_version": SIG_VERSION,
                 "expired": False,
             }
         merged = sorted(records.values(),

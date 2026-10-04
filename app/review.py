@@ -4,10 +4,16 @@
 ID，如 ``c-3-2``）提交确认。确认在保存时绑定条款的四要素：
 
 - **正文**：条款正文逐字一致（编号标记本身不参与）；
-- **父级**：原路径的直接父级稳定 ID（如 ``c-3-2`` 的父级为 ``c-3``）；
+- **父级**：实际存在的直接父条款稳定 ID（如 ``c-3-2`` 的父级为 ``c-3``）。
+  原路径前缀对应的条款在原文中缺失时绑定的是「虚父级」而非真实条款——
+  只有第3.1 / 3.2条而无第3条时，子条款绑定虚父级；之后补入真实第3条，
+  父级绑定由虚变实，子条款确认即过期，须连同新父条款重新确认；
 - **引用目标**：正文中每处引用（按扫描序）的状态与绑定的目标条款集合；
-- **术语绑定**：条款内每处术语使用（按块内偏移）的状态与绑定的定义
-  （定义 ID 由「术语名 + 所在块稳定 ID + 偏移」构成，单纯重编号不会漂移）。
+- **术语绑定**：条款内每处术语使用（按块内同名第 k 次）的状态与绑定的
+  定义。定义与使用一律以**语义键**标识（定义 = 术语名 + 作用域 + 所在块
+  稳定 ID + 同块同名序；使用 = 术语名 + 块内同名序），不依赖字符偏移：
+  在定义条款的定义之前插入普通说明只移动字符位置，使用条款确认保持有效；
+  定义删除 / 改绑 / 变歧义时，相关使用条款确认照常过期。
 
 之后草稿再次保存时 :func:`migrate_confirmations` 逐条比对当前签名：
 
@@ -18,10 +24,14 @@ ID，如 ``c-3-2``）提交确认。确认在保存时绑定条款的四要素�
 - 条款被删除（含级联）→ 该条款确认过期；删除 / 恢复会改变引用目标 / 术语
   绑定，相关条款的引用 / 术语签名同步变化、各自过期；
 - 原路径编号在文本中消失（整块删除或改成其他编号）→ 记录保留为过期，
-  同路径再次出现时仍须重新确认。
+  同路径再次出现时仍须重新确认；过期确认不会因正文改回而自动复活。
+
+历史确认只保存签名哈希，无法核实其当时的绑定口径；凡不带
+:data:`SIG_VERSION` 标记的旧记录一律**保守标过期**，重新确认后方可生效。
 
 签发时 :func:`evaluate_gate` 复查全部存活条款：缺失确认或存在过期确认即整体
-拒绝（不产生版本）；未开启复核的草稿不走本关卡。
+拒绝（不产生版本）；未开启复核的草稿不走本关卡。保存草稿、应用版本差异、
+复核页状态与签发关卡共用 :func:`build_parts` 这同一份绑定判定。
 """
 from __future__ import annotations
 
@@ -36,13 +46,18 @@ from .terms import review_terms
 # 签名维度 -> 过期原因（顺序即展示顺序）
 REASON_LABELS = {
     "body": "条款正文已变化",
-    "parent": "父级层级已变化",
+    "parent": "父级绑定已变化（虚父级补入真实父条款或父级条款改绑）",
     "refs": "引用目标已变化",
     "terms": "术语绑定已变化",
     "lifecycle_deleted": "条款已删除（含父条款级联删除）",
     "clause_missing": "条款已不存在（整块删除或原路径编号变化）",
+    "legacy_sig": "旧版确认只存哈希、无法核实原绑定，需按当前条款重新确认",
 }
 _SIG_KEYS = ("body", "parent", "refs", "terms")
+
+# 签名口径版本：随确认记录保存。签名 / 绑定判定口径调整时前进一号；
+# 旧记录（无此字段）只存了哈希，无法核实当时绑定，一律保守标过期。
+SIG_VERSION = 2
 
 
 def _digest(obj: Any) -> str:
@@ -54,20 +69,54 @@ def _digest(obj: Any) -> str:
     return hashlib.sha256(data.encode("utf-8")).hexdigest()
 
 
-def parent_slug(path: tuple[int, ...]) -> str | None:
-    """稳定父 ID：按原路径前缀（c-3-2 的父为 c-3；顶层为 None）。"""
+def bound_parent(path: tuple[int, ...],
+                 path_to_id: dict[tuple[int, ...], str]) -> str | None:
+    """四要素中的父级绑定：真实父条款的稳定 ID；父级条款在原文缺失时为虚父级。
+
+    - 顶层条款 → ``None``（无父级）；
+    - 路径前缀对应条款真实存在 → 该条款稳定 ID（如 ``c-3``）；
+    - 前缀条款缺失（只有 3.1 / 3.2 而无第3条）→ ``"virtual:" + 前缀 slug``。
+
+    因此「先有子条款、后补入真实父条款」会让子条款的父级绑定由虚变实，
+    子条款确认过期；同父兄弟换序等纯编号变化不改变本绑定。
+    """
     if len(path) <= 1:
         return None
-    return "c-" + "-".join(str(p) for p in path[:-1])
+    pref = path[:-1]
+    real = path_to_id.get(pref)
+    if real is not None:
+        return real
+    return "virtual:c-" + "-".join(str(p) for p in pref)
 
 
 # ---------------------------------------------------------------- 当前签名
+
+def _def_semantic_keys(term_result: dict, clauses) -> dict[str, tuple]:
+    """定义 occ_id → 语义键 (术语名, 作用域, 所在块稳定 ID, 同块同名序)。
+
+    与版本差异审计（audit._def_semantic_map）同口径：键中不含字符偏移，
+    在定义所在块的定义之前插入普通说明不会改变键；同块新增同名定义则
+    序位后移 / 变歧义，相关使用照常过期。
+    """
+    block_doc = {c.id: i for i, c in enumerate(clauses)}
+    defs = sorted(
+        (d for d in term_result.get("definitions", [])),
+        key=lambda d: (block_doc.get(d["block_id"], 10 ** 9), d["start"]),
+    )
+    counters: dict[tuple, int] = {}
+    id_to_key: dict[str, tuple] = {}
+    for d in defs:
+        base = (d["name"], d["scope"], d["block_id"])
+        ordinal = counters.get(base, 0)
+        counters[base] = ordinal + 1
+        id_to_key[d["id"]] = base + (ordinal,)
+    return id_to_key
+
 
 def _parts_from_results(clauses, ref_result: dict,
                         term_result: dict,
                         deleted_set: set[str]) -> dict[str, dict]:
     """按 analyze / review_terms 的结果计算每个条款的当前四要素签名。"""
-    by_id = {c.id: c for c in clauses}
     view = {c["id"]: c for c in ref_result["clauses"]}
     raw = {c.id: _scan(c.text) for c in clauses}
 
@@ -78,6 +127,7 @@ def _parts_from_results(clauses, ref_result: dict,
 
     term_block = {b["id"]: b for b in term_result["blocks"]
                   if b.get("kind") == "clause"}
+    def_semantic = _def_semantic_keys(term_result, clauses)
 
     parts: dict[str, dict] = {}
     for c in clauses:
@@ -95,24 +145,32 @@ def _parts_from_results(clauses, ref_result: dict,
                 targets = []
             ref_entries.append([i, m["status"], sorted(set(targets))])
 
-        # ---- 术语：每处使用（块内偏移, 名称, 状态, 绑定的定义 ID 集合）----
-        term_entries: list[list[Any]] = []
+        # ---- 术语：使用按「块内同名第 k 次」对齐（不随字符位移），
+        #      绑定的定义用语义键（术语名+作用域+所在块+同块同名序）----
+        use_entries: list[list[Any]] = []
+        name_ord: dict[str, int] = {}
         tb = term_block.get(c.id)
         if tb:
-            for m in tb.get("marks", []):
-                if m.get("kind") != "use":
-                    continue
-                term_entries.append([
-                    m["start"], m["name"], m["status"],
-                    sorted(m.get("target_ids") or []),
+            use_marks = sorted(
+                (m for m in tb.get("marks", []) if m.get("kind") == "use"),
+                key=lambda m: m["start"],
+            )
+            for m in use_marks:
+                ordinal = name_ord.get(m["name"], 0)
+                name_ord[m["name"]] = ordinal + 1
+                target_keys = sorted(
+                    def_semantic[did] for did in (m.get("target_ids") or [])
+                    if did in def_semantic
+                )
+                use_entries.append([
+                    m["name"], ordinal, m["status"], target_keys,
                 ])
-        term_entries.sort(key=lambda e: e[0])
 
         sig = {
             "body": _digest(c.text),
-            "parent": _digest(parent_slug(c.path) or ""),
+            "parent": _digest(bound_parent(c.path, path_to_id) or ""),
             "refs": _digest(ref_entries),
-            "terms": _digest(term_entries),
+            "terms": _digest(use_entries),
         }
         alive = c.id not in deleted_set
         struct = next((x for x in ref_result["result"] if x["id"] == c.id), None)
@@ -153,6 +211,11 @@ def _diff_reasons(old_sig: dict, new_sig: dict) -> list[str]:
     return [k for k in _SIG_KEYS if old_sig.get(k) != new_sig.get(k)]
 
 
+def _is_legacy(rec: dict) -> bool:
+    """旧口径确认（只存哈希、无签名版本标记）：无法核实原绑定，保守处理。"""
+    return rec.get("sig_version") != SIG_VERSION
+
+
 def migrate_confirmations(records: list[dict], parts: dict[str, dict],
                           revision: int) -> list[dict]:
     """草稿保存为新修订后迁移确认记录（不碰数据库，由调用方随事务写入）。
@@ -162,7 +225,10 @@ def migrate_confirmations(records: list[dict], parts: dict[str, dict],
     - 条款当前不存活（删除 / 级联）→ 其既有确认过期；
     - 已过期确认保持过期，过期原因按当前签名重新计算；
     - 条款彻底消失（无当前 parts）→ 记录保留为过期（clause_missing）；
-    - 从无确认记录的条款不产生行（状态接口按「待确认」呈现）。
+    - 从无确认记录的条款不产生行（状态接口按「待确认」呈现）；
+    - 旧口径确认（无 :data:`SIG_VERSION` 标记，历史上只存哈希）无法核实
+      当时绑定，无论签名是否碰巧一致都**保守标过期**，重新确认后方可生效；
+    - 已过期确认不会因正文 / 顺序改回原样而自动复活（过期粘性）。
     """
     existing = {r["clause_id"]: r for r in records}
     out: list[dict] = []
@@ -178,19 +244,24 @@ def migrate_confirmations(records: list[dict], parts: dict[str, dict],
             rec["expire_reasons"] = ["lifecycle_deleted"]
             out.append(rec)
             continue
-        if rec.get("expired"):
-            # 粘性过期：原因按当前签名刷新，首次过期修订号保留
-            reasons = _diff_reasons(rec.get("sig", {}), part["sig"]) \
-                or rec.get("expire_reasons") or list(_SIG_KEYS)
-            rec["expire_reasons"] = reasons
-            rec.setdefault("expire_revision", revision)
+        if not _is_legacy(rec) and not rec.get("expired"):
+            reasons = _diff_reasons(rec.get("sig", {}), part["sig"])
+            if reasons:
+                rec["expired"] = True
+                rec["expire_revision"] = revision
+                rec["expire_reasons"] = reasons
             out.append(rec)
             continue
-        reasons = _diff_reasons(rec.get("sig", {}), part["sig"])
-        if reasons:
-            rec["expired"] = True
-            rec["expire_revision"] = revision
-            rec["expire_reasons"] = reasons
+        # 已过期（粘性）或旧口径确认：保持过期。旧口径给 legacy_sig；
+        # 其余过期原因按当前签名刷新，首次过期修订号保留。
+        rec["expired"] = True
+        rec.setdefault("expire_revision", revision)
+        if _is_legacy(rec):
+            rec["expire_reasons"] = ["legacy_sig"]
+        else:
+            rec["expire_reasons"] = (
+                _diff_reasons(rec.get("sig", {}), part["sig"])
+                or rec.get("expire_reasons") or list(_SIG_KEYS))
         out.append(rec)
 
     for cid, rec in existing.items():
@@ -212,7 +283,7 @@ def _clause_state(rec: dict | None, part: dict) -> str:
         return "deleted"
     if rec is None:
         return "pending"
-    if rec.get("expired"):
+    if rec.get("expired") or _is_legacy(rec):
         return "expired"
     if _diff_reasons(rec.get("sig", {}), part["sig"]):
         return "expired"
@@ -223,8 +294,11 @@ def _clause_desc(cid: str, state: str, part: dict,
                  rec: dict | None) -> dict:
     reasons = []
     if state == "expired":
-        codes = (rec.get("expire_reasons") if rec else None) \
-            or _diff_reasons((rec or {}).get("sig", {}), part["sig"])
+        if rec is not None and _is_legacy(rec):
+            codes = ["legacy_sig"]
+        else:
+            codes = (rec.get("expire_reasons") if rec else None) \
+                or _diff_reasons((rec or {}).get("sig", {}), part["sig"])
         reasons = codes or list(_SIG_KEYS)
     return {
         "clause_id": cid,
