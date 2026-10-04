@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>条款引用重排台</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">§</span>
+      <div>
+        <h1>条款引用重排台</h1>
+        <p class="subtitle">粘贴带层级编号的合同条款 → 拖动重排 → 引用自动重编号</p>
+      </div>
+    </div>
+    <div class="top-actions">
+      <button id="btn-example" class="btn btn-ghost" type="button">载入示例</button>
+      <div class="draft-group">
+        <select id="draft-select" title="选择草稿">
+          <option value="">— 已保存草稿 —</option>
+        </select>
+        <button id="btn-save" class="btn" type="button">保存草稿</button>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <!-- 输入区 -->
+    <section class="panel input-panel">
+      <div class="panel-head">
+        <h2>① 粘贴合同文本</h2>
+        <div class="hint">支持「第3.2条」「第3.2.1条」「第五条」及「1.2」层级编号；支持「第5条至第7条」区间引用</div>
+      </div>
+      <textarea id="contract-input" spellcheck="false"
+        placeholder="在此粘贴合同条款，例如：&#10;第1条 定义&#10;本协议所称……&#10;第2条 服务内容&#10;乙方应按第1条约定……"></textarea>
+      <div class="input-foot">
+        <button id="btn-parse" class="btn btn-primary" type="button">解析并重排</button>
+        <span id="parse-status" class="parse-status"></span>
+      </div>
+    </section>
+
+    <!-- 工作区（解析后显示） -->
+    <section id="workspace" class="workspace hidden">
+      <div class="mode-tabs" role="tablist">
+        <button id="tab-refs" class="mode-tab active" type="button" role="tab">§ 引用重排 / 改写</button>
+        <button id="tab-terms" class="mode-tab" type="button" role="tab">📖 定义术语审校</button>
+        <button id="tab-review" class="mode-tab" type="button" role="tab">✅ 逐条复核</button>
+        <button id="tab-versions" class="mode-tab" type="button" role="tab">🔖 生效版本</button>
+      </div>
+
+      <!-- 模式一：引用重排 -->
+      <div id="pane-refs" class="mode-pane">
+      <div class="panel order-panel">
+        <div class="panel-head">
+          <h2>② 按层级拖动调整顺序</h2>
+          <div class="hint">仅同一父级下的兄弟可换序；拖动父条款会连同整棵子树一起移动，删除父条款一并删除子条款</div>
+        </div>
+        <div id="issues-bar" class="issues-bar hidden"></div>
+        <div id="preview-bar" class="preview-bar">
+          <button id="btn-preview" class="btn btn-primary btn-sm" type="button" disabled>
+            🔍 删除影响预演（已选 <span id="preview-count">0</span> 项）
+          </button>
+          <span class="hint">勾选下方未删除条款的复选框后先预演：父条款按现有规则连同后代纳入拟删除集；预演只预览、不改草稿</span>
+        </div>
+        <ul id="sortable" class="sortable"></ul>
+        <div id="tray" class="tray hidden">
+          <div class="tray-head">已删除（点击恢复）</div>
+          <div id="tray-list" class="tray-list"></div>
+        </div>
+
+        <div id="preview-pane" class="preview-pane hidden">
+          <div class="panel-head">
+            <h2>🔍 删除影响预演（预览中，草稿未修改）</h2>
+          </div>
+          <div id="preview-stale" class="preview-stale hidden">
+            ⚠ 正文、排序或删除状态已变化，本预演结果已过期，不能直接确认；
+            <button id="btn-repreview" class="btn btn-sm" type="button">按当前选择重新预演</button>
+          </div>
+          <div id="preview-summary" class="preview-summary"></div>
+          <div class="preview-section">
+            <div class="preview-section-title">拟删除集（含父条款级联的后代）</div>
+            <div id="preview-delete" class="preview-chips"></div>
+          </div>
+          <div class="preview-section">
+            <div class="preview-section-title">删除后仍存活、但绑定受影响的条款（循环条款按强连通分量合并为一项；组成员与根因均可点击定位，↺ 表示引用循环）</div>
+            <div id="preview-impacts" class="preview-impacts"></div>
+          </div>
+          <div class="preview-actions">
+            <button id="btn-confirm-delete" class="btn btn-danger" type="button">确认删除（一次性套用级联删除并重排 / 改写 / 术语审校）</button>
+            <button id="btn-cancel-preview" class="btn btn-ghost" type="button">取消（草稿不变）</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel compare-panel">
+        <div class="panel-head">
+          <h2>③ 改动前后对照</h2>
+          <div class="legend">
+            <span class="lg lg-ok">已重写</span>
+            <span class="lg lg-unparsable">无法解析</span>
+            <span class="lg lg-deleted">目标已删除</span>
+            <span class="lg lg-circular">循环引用</span>
+          </div>
+        </div>
+        <div class="compare-cols">
+          <div class="col">
+            <div class="col-title">改动前（原文）</div>
+            <div id="before-view" class="doc-view"></div>
+          </div>
+          <div class="col">
+            <div class="col-title">改动后（新编号）</div>
+            <div id="after-view" class="doc-view"></div>
+          </div>
+        </div>
+      </div>
+      </div>
+
+      <!-- 模式二：定义术语审校 -->
+      <div id="pane-terms" class="mode-pane hidden">
+      <div class="panel terms-side">
+        <div class="panel-head">
+          <h2>术语问题</h2>
+          <div class="hint">点击条目可定位正文；「忽略」随草稿保存，可在下方恢复</div>
+        </div>
+        <div id="term-issues" class="term-issues"></div>
+        <div class="panel-head term-subhead"><h2>已定义术语</h2></div>
+        <div id="term-defs" class="term-defs"></div>
+        <div id="term-ignored" class="term-ignored hidden">
+          <div class="tray-head">已忽略（点击恢复）</div>
+          <div id="term-ignored-list" class="tray-list"></div>
+        </div>
+      </div>
+
+      <div class="panel terms-main">
+        <div class="panel-head">
+          <h2>术语标注（当前删除状态）</h2>
+          <div class="legend">
+            <span class="lg lg-t-def">定义</span>
+            <span class="lg lg-t-use">使用·已绑定</span>
+            <span class="lg lg-unparsable">未定义</span>
+            <span class="lg lg-deleted">重复定义</span>
+            <span class="lg lg-circular">歧义绑定</span>
+            <span class="lg lg-unused">未使用</span>
+          </div>
+        </div>
+        <div id="terms-view" class="doc-view"></div>
+      </div>
+      </div>
+
+      <!-- 模式三：逐条复核 -->
+      <div id="pane-review" class="mode-pane hidden">
+        <div class="panel review-panel">
+          <div class="panel-head">
+            <h2>逐条复核确认</h2>
+            <div class="hint">开启复核后，可按稳定条款 ID 逐条确认存活条款；确认对应保存时的正文、父级、引用目标与术语绑定。之后仅相关条款因正文 / 父级 / 绑定变化而过期，单纯编号变化不撤销确认。开启复核的草稿签发时，全部存活条款须为有效确认，且草稿修订号一致，否则整体拒绝、不产生版本</div>
+          </div>
+          <div class="review-toolbar">
+            <label class="review-switch">
+              <input type="checkbox" id="review-enabled" />
+              <span>开启逐条复核</span>
+            </label>
+            <button id="btn-review-refresh" class="btn btn-sm" type="button">刷新复核状态</button>
+            <span id="review-revision" class="issue-revision"></span>
+            <span class="review-toolbar-spacer"></span>
+            <button id="btn-review-confirm-pending" class="btn btn-primary btn-sm" type="button">
+              ✓ 确认全部待确认条款
+            </button>
+          </div>
+          <div id="review-dirty" class="review-dirty hidden">
+            ⚠ 当前有未保存修改：复核确认只对应已保存修订。请先
+            <button id="btn-review-save" class="btn btn-sm" type="button">保存草稿</button>
+            后再确认；确认按钮已暂时禁用。
+          </div>
+          <div id="review-off" class="review-off hidden">
+            本草稿尚未开启逐条复核。勾选上方「开启逐条复核」后即可按稳定条款 ID
+            逐条确认存活条款；未开启复核的草稿仍按原规则签发。
+          </div>
+          <div id="review-summary" class="review-summary"></div>
+          <div id="review-list" class="review-list"></div>
+        </div>
+      </div>
+
+      <!-- 模式四：生效版本签发 -->
+      <div id="pane-versions" class="mode-pane hidden">
+        <div class="panel issue-panel">
+          <div class="panel-head">
+            <h2>生效版本签发</h2>
+            <div class="hint">签发将一次性固定正文、顺序、删除状态与术语忽略项，重跑引用与术语终审；存在未解决问题或草稿在签发期间被修改都会被拒绝，且不改动草稿。已开启逐条复核的草稿还须全部存活条款均为有效确认（缺失 / 过期 / 并发修改均整体拒绝，不产生版本）</div>
+          </div>
+          <div id="issue-actions" class="issue-actions">
+            <button id="btn-issue" class="btn btn-primary" type="button">🔖 从当前草稿签发生效版本</button>
+            <span id="issue-revision" class="issue-revision"></span>
+          </div>
+          <div id="issue-review-hint" class="issue-review-hint hidden"></div>
+          <div id="issue-blockers" class="issue-blockers hidden"></div>
+          <div id="issue-success" class="issue-success hidden"></div>
+        </div>
+
+        <div class="panel versions-panel">
+          <div class="panel-head">
+            <h2>已签发版本（不可变）</h2>
+            <div class="hint">后续编辑只产生新版本，不会覆盖已签发版本；重复提交同一份草稿返回原版本。点击版本查看并定位签发时的正文、编号、引用改写与术语绑定</div>
+          </div>
+          <div id="version-list" class="version-list"></div>
+        </div>
+
+        <div class="panel audit-panel">
+          <div class="panel-head">
+            <h2>版本差异审计</h2>
+            <div class="hint">选择同一草稿的两个已签发版本：按原条款稳定 ID 对齐两份不可变快照，区分正文改变 / 层级顺序调整 / 删除新增 / 仅编号改写，并逐条比较引用目标、区间表达与术语绑定；对目标删除或绑定改变的差异给出最短受影响链（循环组合并）。审计只读版本快照，草稿后续编辑或删除均不影响结果</div>
+          </div>
+          <div class="audit-form">
+            <label class="audit-pick">
+              <span>旧版（基准）</span>
+              <select id="audit-old"><option value="">— 选择版本 —</option></select>
+            </label>
+            <span class="audit-arrow">→</span>
+            <label class="audit-pick">
+              <span>新版（对比）</span>
+              <select id="audit-new"><option value="">— 选择版本 —</option></select>
+            </label>
+            <button id="btn-audit" class="btn btn-primary" type="button" disabled>🔍 生成版本差异审计</button>
+            <span id="audit-status" class="parse-status"></span>
+          </div>
+          <div id="apply-pane" class="apply-pane hidden">
+            <div class="panel-head">
+              <h2>应用到当前草稿</h2>
+              <div class="hint">以审计旧版为基线、新版为候选，逐条勾选要带入的正文 / 父子顺序层级 / 删除或恢复变更；未选项保留当前草稿。引用改写与术语绑定<b>不直接拼接</b>，在合并后的文本、顺序、删除状态上重新计算。当前草稿相对旧版已改动同一条款或其父级时标为冲突并禁止该项覆盖</div>
+            </div>
+            <div id="apply-banner" class="apply-banner"></div>
+            <div class="apply-toolbar">
+              <label class="apply-selectall"><input type="checkbox" id="apply-selectall" /> 全选无冲突项</label>
+              <span id="apply-summary" class="apply-summary"></span>
+              <button id="btn-apply-fetch" class="btn btn-sm" type="button">重新载入合并预览</button>
+              <button id="btn-apply-submit" class="btn btn-primary" type="button">✓ 应用勾选项到当前草稿（一次事务保存新修订）</button>
+            </div>
+            <div id="apply-items" class="apply-items"></div>
+            <div id="apply-sides" class="apply-sides"></div>
+          </div>
+          <div id="audit-result" class="audit-result hidden"></div>
+        </div>
+
+        <div id="version-viewer" class="panel version-viewer hidden"></div>
+      </div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast hidden"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
